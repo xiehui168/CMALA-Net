@@ -7,7 +7,7 @@ Cross-Modal Alignment with LoRA Adaptation Network for breast ultrasound + patho
 │   └── path/        #  path_0001.png
 ├── train.csv
 ├── val.csv
-├── test.csv       # Center B 测试集
+├── test.csv       
 
 
 
