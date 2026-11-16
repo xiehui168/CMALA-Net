@@ -18,6 +18,7 @@ from sklearn.manifold import TSNE
 from model import CMALANet
 # 修复导入：直接导入真实存在的 PathologyDataset，同时保留原名称兼容
 from dataset import PathologyDataset, SUBTYPE_NAMES, BIOMARKER_NAMES, create_dataloaders
+from backbones import BACKBONE_NAMES, get_backbone_norm, BACKBONE_REGISTRY
 # 原地别名，不修改 dataset.py 任何内容
 BreastCancerDataset = PathologyDataset
 
@@ -33,6 +34,11 @@ def parse_args():
     parser.add_argument('--img_size', type=int, default=224)
     parser.add_argument('--dinov2_path', type=str, default=None,
                         help='本地DINOv2模型路径（离线使用）')
+    parser.add_argument('--path_backbone', type=str, default=None,
+                        choices=BACKBONE_NAMES,
+                        help='病理 backbone; 默认从 checkpoint 的 args 读取')
+    parser.add_argument('--path_ckpt', type=str, default=None,
+                        help='病理 backbone 本地权重 (目录或文件)')
     return parser.parse_args()
 
 
@@ -285,6 +291,13 @@ def main():
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     ckpt_args = checkpoint.get('args', {})
 
+    # backbone 优先用命令行指定, 否则读 checkpoint 训练时的配置 (旧权重默认 dinov2)
+    path_backbone = args.path_backbone or ckpt_args.get('path_backbone', 'dinov2')
+    path_ckpt = args.path_ckpt or ckpt_args.get('path_ckpt', None)
+    print(f"Path backbone: {path_backbone} "
+          f"({BACKBONE_REGISTRY[path_backbone]['display']})")
+    path_mean, path_std = get_backbone_norm(path_backbone)
+
     model = CMALANet(
         embed_dim=ckpt_args.get('embed_dim', 1024),
         lora_rank=ckpt_args.get('lora_rank', 16),
@@ -292,16 +305,28 @@ def main():
         sinkhorn_eps=ckpt_args.get('sinkhorn_eps', 0.06),
         sinkhorn_iters=ckpt_args.get('sinkhorn_iters', 50),
         pretrained=False,
-        dinov2_path=args.dinov2_path
+        dinov2_path=args.dinov2_path,
+        path_backbone=path_backbone,
+        path_ckpt=path_ckpt,
     ).to(device)
 
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # 兼容旧版 checkpoint: 病理 backbone 未包装时键名为 path_backbone.xxx,
+    # 现统一封装为 wrapper, 需映射为 path_backbone.model.xxx
+    state_dict = {
+        (k.replace('path_backbone.', 'path_backbone.model.', 1)
+         if k.startswith('path_backbone.')
+         and not k.startswith('path_backbone.model.')
+         else k): v
+        for k, v in checkpoint['model_state_dict'].items()
+    }
+    model.load_state_dict(state_dict)
     print(f"Loaded checkpoint from epoch {checkpoint.get('epoch', '?')}")
 
     # 修复数据加载：直接传CSV路径，替换不存在的 augment 参数
     test_dataset = BreastCancerDataset(
         args.test_csv, img_size=args.img_size, is_train=False,
-        us_dir=args.us_dir, path_dir=args.path_dir
+        us_dir=args.us_dir, path_dir=args.path_dir,
+        path_mean=path_mean, path_std=path_std,
     )
     test_loader = torch.utils.data.DataLoader(
         test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0

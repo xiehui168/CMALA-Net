@@ -1,68 +1,25 @@
 """
 CMALA-Net: Cross-Modal Optimal Transport for Weakly Supervised Breast Cancer Subtyping
 核心模型实现 - 数值稳定 Sinkhorn + 保留 patch 信息避免 OT 退化
+
+病理分支 backbone 可通过 path_backbone 参数切换:
+  dinov2 / uni / uni2h / virchow2 / gigapath / hoptimus1 / chief
+  (定义见 backbones.py, 用于 backbone 对比实验)
 """
-import os
 import math
-import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
-from transformers import Dinov2Model, AutoConfig
 
-HF_MIRRORS = [
-    "https://hf-mirror.com",
-    "https://huggingface.co",
-]
-
-
-def _configure_hf_endpoint():
-    if os.environ.get("HF_ENDPOINT"):
-        return
-    os.environ["HF_ENDPOINT"] = HF_MIRRORS[0]
-    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "600")
-    os.environ.setdefault("REQUESTS_CA_BUNDLE", "")
-    os.environ.setdefault("CURL_CA_BUNDLE", "")
-    warnings.filterwarnings('ignore', message='Unverified HTTPS request')
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-
-_configure_hf_endpoint()
+from backbones import (
+    create_path_backbone, BACKBONE_REGISTRY, BACKBONE_NAMES, HF_MIRRORS,
+)
 
 
 def load_dinov2_with_fallback(pretrained=True):
-    model_name = 'facebook/dinov2-large'
-
-    if not pretrained:
-        config = AutoConfig.from_pretrained(model_name)
-        model = Dinov2Model(config)
-        print("[INFO] Using randomly initialized DINOv2 (pretrained=False)")
-        return model
-
-    for i, endpoint in enumerate(HF_MIRRORS):
-        try:
-            os.environ["HF_ENDPOINT"] = endpoint
-            print(f"[INFO] Loading DINOv2 from: {endpoint}")
-            model = Dinov2Model.from_pretrained(
-                model_name,
-                resume_download=True,
-                local_files_only=False,
-            )
-            print(f"[OK] DINOv2 loaded successfully from {endpoint}")
-            return model
-        except Exception as e:
-            print(f"[WARNING] Failed to load from {endpoint}: {type(e).__name__}")
-            if i < len(HF_MIRRORS) - 1:
-                print(f"[INFO] Trying next mirror...")
-            continue
-
-    print("\n" + "=" * 70)
-    print("[WARNING] 自动下载失败，将使用随机初始化 DINOv2 进行测试")
-    print("=" * 70 + "\n")
-    config = AutoConfig.from_pretrained(model_name)
-    return Dinov2Model(config)
+    """兼容旧接口: 等价于 create_path_backbone('dinov2').model"""
+    return create_path_backbone('dinov2', pretrained=pretrained).model
 
 
 class LoRALayer(nn.Module):
@@ -200,7 +157,10 @@ class CMALANet(nn.Module):
         sinkhorn_iters=50,
         pretrained=True,
         dinov2_path=None,
-        swin_pretrained=True
+        swin_pretrained=True,
+        path_backbone='dinov2',
+        path_ckpt=None,
+        img_size=224
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -230,14 +190,21 @@ class CMALANet(nn.Module):
             nn.Linear(us_feat_dim, embed_dim)
         )
 
-        # ===== 病理分支: DINOv2 =====
-        if dinov2_path is not None and os.path.exists(dinov2_path):
-            print(f"[INFO] Loading DINOv2 from local path: {dinov2_path}")
-            self.path_backbone = Dinov2Model.from_pretrained(dinov2_path)
-        else:
-            self.path_backbone = load_dinov2_with_fallback(pretrained=pretrained)
-
-        path_feat_dim = self.path_backbone.config.hidden_size
+        # ===== 病理分支: 可切换 backbone (见 backbones.py) =====
+        # 兼容旧参数 dinov2_path
+        if path_ckpt is None and dinov2_path is not None \
+                and path_backbone == 'dinov2':
+            path_ckpt = dinov2_path
+        self.path_backbone_name = path_backbone
+        print(f"[INFO] Pathology backbone: "
+              f"{BACKBONE_REGISTRY[path_backbone]['display']} ({path_backbone})")
+        self.path_backbone = create_path_backbone(
+            path_backbone,
+            pretrained=pretrained,
+            ckpt_path=path_ckpt,
+            img_size=img_size,
+        )
+        path_feat_dim = self.path_backbone.feat_dim
 
         self.path_proj = nn.Sequential(
             nn.LayerNorm(path_feat_dim),
@@ -290,7 +257,10 @@ class CMALANet(nn.Module):
 
     def _apply_lora(self, rank, alpha):
         apply_lora_to_model(self.us_backbone, rank=rank, alpha=alpha)
-        apply_lora_to_model(self.path_backbone, rank=rank, alpha=alpha)
+        # 不同 backbone 的 Linear 层命名不同 (ViT/SwiGLU/HF-DINOv2)
+        targets = getattr(self.path_backbone, 'lora_targets', None)
+        apply_lora_to_model(self.path_backbone, rank=rank, alpha=alpha,
+                            target_modules=targets)
 
     def _freeze_backbone(self):
         for name, param in self.us_backbone.named_parameters():
@@ -308,8 +278,7 @@ class CMALANet(nn.Module):
         return patch_features
 
     def extract_path_patches(self, x):
-        outputs = self.path_backbone(x)
-        patch_features = outputs.last_hidden_state[:, 1:, :]
+        patch_features = self.path_backbone.forward_patches(x)
         patch_features = self.path_proj(patch_features)
         return patch_features
 

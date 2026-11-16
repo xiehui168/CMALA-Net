@@ -1,10 +1,5 @@
 """
-CMALA-Net 训练脚本（修复版）
-关键修复：
-  1. grad_clip 从 1.0 提到 5.0（原值把有效学习率砍到 1/40）
-  2. last_good_state 只在 NaN 时保存（避免每个 batch 复制 1.6GB）
-  3. 添加梯度范数日志 + 类别分布诊断
-  4. 添加 warmup + 提高对比温度
+CMALA-Net 训练脚本
 """
 import os
 import json
@@ -20,6 +15,27 @@ from collections import Counter
 from model import CMALANet
 from losses import CMALALoss
 from dataset import create_dataloaders, SUBTYPE_NAMES, BIOMARKER_NAMES
+from backbones import BACKBONE_NAMES, BACKBONE_REGISTRY, get_backbone_norm
+
+
+# =========================================================
+# Windows 修复: DataLoader worker 已被外部终止时, epoch 结束
+# _shutdown_workers -> TerminateProcess 偶发 PermissionError
+# [WinError 5] (句柄失效)。terminate 本就是尽力而为, 静默即可。
+# =========================================================
+import multiprocessing.process as _mp_process
+
+_orig_terminate = _mp_process.BaseProcess.terminate
+
+
+def _safe_terminate(self):
+    try:
+        _orig_terminate(self)
+    except PermissionError:
+        pass
+
+
+_mp_process.BaseProcess.terminate = _safe_terminate
 
 
 # =========================================================
@@ -82,11 +98,24 @@ def parse_args():
     parser.add_argument('--nan_lr_decay', type=float, default=0.5)
 
     parser.add_argument('--output_dir', type=str, default='checkpoints/')
-    parser.add_argument('--save_name', type=str, default='cmalanet_best.pth')
-    parser.add_argument('--last_name', type=str, default='cmalanet_last.pth')
+    parser.add_argument('--save_name', type=str, default=None,
+                        help='best 权重文件名; 默认 cmalanet_<backbone>_best.pth')
+    parser.add_argument('--last_name', type=str, default=None,
+                        help='last 权重文件名; 默认 cmalanet_<backbone>_last.pth')
+    parser.add_argument('--resume', type=str, nargs='?', const='auto',
+                        default=None,
+                        help='断点续训: 从 last checkpoint 恢复模型/优化器/epoch 继续训练; '
+                             '不带路径时默认 <output_dir>/<last_name>')
     parser.add_argument('--pretrained', action='store_true', default=True)
     parser.add_argument('--no_pretrained', action='store_false', dest='pretrained')
-    parser.add_argument('--dinov2_path', type=str, default=None)
+    parser.add_argument('--dinov2_path', type=str, default=None,
+                        help='(旧参数, 兼容) 本地 DINOv2 路径')
+    parser.add_argument('--path_backbone', type=str, default='uni',
+                        choices=BACKBONE_NAMES,
+                        help='病理分支 backbone (对比实验用); 默认 uni (论文主模型)')
+    parser.add_argument('--path_ckpt', type=str, default=None,
+                        help='病理 backbone 本地权重: HF snapshot 目录或权重文件 '
+                             '(CHIEF 必须传 CHIEF.pth 文件)')
     parser.add_argument('--demo', action='store_true')
 
     return parser.parse_args()
@@ -180,7 +209,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scaler, device,
     loss_meter = {k: 0.0 for k in
                   ['ce', 'focal', 'contrastive', 'auxiliary', 'mmd']}
 
-    # ==== 关键修复：只在 NaN 时保存，不每 batch 复制 ====
+    
     last_good_state = None
     need_save_state = True   # 第一个 batch 前保存一次
 
@@ -378,11 +407,23 @@ def evaluate(model, dataloader, criterion, device, use_amp=False):
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # 默认权重文件名带 backbone 后缀, 避免对比实验互相覆盖
+    if args.save_name is None:
+        args.save_name = f'cmalanet_{args.path_backbone}_best.pth'
+    if args.last_name is None:
+        args.last_name = f'cmalanet_{args.path_backbone}_last.pth'
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
+    print(f"Path backbone: {args.path_backbone} "
+          f"({BACKBONE_REGISTRY[args.path_backbone]['display']})")
     print(f"AMP enabled: {args.amp}")
     print(f"grad_clip: {args.grad_clip}")
     print(f"lr: {args.lr}")
+
+    # 病理图像归一化 (H-optimus-1 等有官方推荐统计量)
+    path_mean, path_std = get_backbone_norm(args.path_backbone)
 
     # ===== 数据 =====
     print("\n" + "=" * 60)
@@ -412,7 +453,9 @@ def main():
         img_size=args.img_size,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        val_split=0.2 if args.val_csv is None else 0
+        val_split=0.2 if args.val_csv is None else 0,
+        path_mean=path_mean,
+        path_std=path_std,
     )
 
     print(f"Train batches: {len(dataloaders['train'])}")
@@ -455,7 +498,10 @@ def main():
         sinkhorn_eps=args.sinkhorn_eps,
         sinkhorn_iters=args.sinkhorn_iters,
         pretrained=args.pretrained and not args.demo,
-        dinov2_path=args.dinov2_path
+        dinov2_path=args.dinov2_path,
+        path_backbone=args.path_backbone,
+        path_ckpt=args.path_ckpt,
+        img_size=args.img_size,
     ).to(device)
 
     trainable, total = model.get_trainable_params()
@@ -487,16 +533,35 @@ def main():
 
     scaler = make_grad_scaler(args.amp)
 
+    # ===== 断点续训 =====
+    start_epoch = 0
+    best_f1 = 0.0
+    best_epoch = 0
+    patience_counter = 0
+    if args.resume:
+        resume_path = (os.path.join(args.output_dir, args.last_name)
+                       if args.resume == 'auto' else args.resume)
+        if os.path.isfile(resume_path):
+            ckpt = torch.load(resume_path, map_location=device,
+                              weights_only=False)
+            model.load_state_dict(ckpt['model_state_dict'])
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            start_epoch = ckpt['epoch'] + 1
+            best_f1 = ckpt.get('best_f1', 0.0)
+            best_epoch = ckpt.get('best_epoch', ckpt['epoch'])
+            patience_counter = max(0, ckpt['epoch'] - best_epoch)
+            print(f"[resume] 从 {resume_path} 恢复: 从 epoch {start_epoch + 1} 继续, "
+                  f"best_f1={best_f1:.4f} (epoch {best_epoch + 1}), "
+                  f"patience={patience_counter}")
+        else:
+            print(f"[resume] 未找到 {resume_path}, 从头训练")
+
     # ===== 训练 =====
     print("\n" + "=" * 60)
     print("Starting training...")
     print("=" * 60)
 
-    best_f1 = 0.0
-    best_epoch = 0
-    patience_counter = 0
-
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         print(f"\nEpoch {epoch+1}/{args.epochs}")
         print("-" * 40)
 
@@ -546,6 +611,7 @@ def main():
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'best_f1': best_f1,
+                    'best_epoch': best_epoch,
                     'args': vars(args)
                 }, os.path.join(args.output_dir, args.save_name))
                 print(f"  -> Saved best model (Macro-F1: {best_f1:.4f})")
@@ -558,6 +624,7 @@ def main():
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'best_f1': best_f1,
+                'best_epoch': best_epoch,
                 'args': vars(args)
             }, os.path.join(args.output_dir, args.last_name))
 

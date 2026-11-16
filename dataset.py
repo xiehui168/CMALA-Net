@@ -21,12 +21,16 @@ CENTER_TO_ID = {'A': 0, 'B': 1, 'C': 2}
 
 class PathologyDataset(Dataset):
     def __init__(self, csv_path, img_size=224, is_train=True,
-                 us_dir=None, path_dir=None):
+                 us_dir=None, path_dir=None, path_mean=None, path_std=None):
         self.df = pd.read_csv(csv_path)
         self.img_size = img_size
         self.is_train = is_train
         self.us_dir = us_dir
         self.path_dir = path_dir
+
+        # 病理分支归一化统计量 (部分 backbone 如 H-optimus-1 有官方推荐值)
+        pm = list(path_mean) if path_mean is not None else [0.485, 0.456, 0.406]
+        ps = list(path_std) if path_std is not None else [0.229, 0.224, 0.225]
 
         # ==== 关键：保存 CSV 所在目录，用于路径解析 ====
         self.csv_path = csv_path
@@ -56,8 +60,7 @@ class PathologyDataset(Dataset):
                 transforms.RandomRotation(15),
                 transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
                 transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225]),
+                transforms.Normalize(mean=pm, std=ps),
             ])
         else:
             self.us_transform = transforms.Compose([
@@ -71,8 +74,7 @@ class PathologyDataset(Dataset):
                 transforms.ToPILImage(),
                 transforms.Resize((img_size, img_size)),
                 transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225]),
+                transforms.Normalize(mean=pm, std=ps),
             ])
 
     def __len__(self):
@@ -200,9 +202,12 @@ def create_dataloaders(train_csv, val_csv, test_csvs=None,
         test_csvs = kwargs['test_csv']
     us_dir = kwargs.get('us_dir', None)
     path_dir = kwargs.get('path_dir', None)
+    path_mean = kwargs.get('path_mean', None)
+    path_std = kwargs.get('path_std', None)
 
     train_ds = PathologyDataset(train_csv, img_size=img_size, is_train=True,
-                                us_dir=us_dir, path_dir=path_dir)
+                                us_dir=us_dir, path_dir=path_dir,
+                                path_mean=path_mean, path_std=path_std)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                               num_workers=num_workers, pin_memory=pin_memory,
                               drop_last=True)
@@ -210,7 +215,8 @@ def create_dataloaders(train_csv, val_csv, test_csvs=None,
     val_loader = None
     if val_csv is not None:
         val_ds = PathologyDataset(val_csv, img_size=img_size, is_train=False,
-                                  us_dir=us_dir, path_dir=path_dir)
+                                  us_dir=us_dir, path_dir=path_dir,
+                                  path_mean=path_mean, path_std=path_std)
         val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
                                 num_workers=num_workers, pin_memory=pin_memory)
 
@@ -218,7 +224,8 @@ def create_dataloaders(train_csv, val_csv, test_csvs=None,
     if test_csvs is not None:
         def _add(name, path):
             ds = PathologyDataset(path, img_size=img_size, is_train=False,
-                                  us_dir=us_dir, path_dir=path_dir)
+                                  us_dir=us_dir, path_dir=path_dir,
+                                  path_mean=path_mean, path_std=path_std)
             test_loaders[name] = DataLoader(ds, batch_size=batch_size,
                                             shuffle=False,
                                             num_workers=num_workers,
